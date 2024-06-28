@@ -13,79 +13,52 @@
 #include <mruby/internal.h>
 #include <mruby/presym.h>
 
+typedef struct iv_tbl_entry {
+  mrb_sym key;
+  mrb_value value;
+} iv_tbl_entry;
+
 /* Instance variable table structure */
 typedef struct iv_tbl {
   int size, alloc;
-  mrb_value *ptr;
+  iv_tbl_entry entries[];
 } iv_tbl;
 
 #define IV_EMPTY 0
 #define IV_DELETED (1UL<<31)
 #define IV_KEY_P(k) (((k)&~((uint32_t)IV_DELETED))!=0)
-
+#define IV_TABLE_SIZE(count) (sizeof(iv_tbl) + (count) * sizeof(iv_tbl_entry))
 /* Creates the instance variable table. */
 static iv_tbl*
-iv_new(mrb_state *mrb)
+iv_new(mrb_state *mrb, int count)
 {
   iv_tbl *t;
 
-  t = (iv_tbl*)mrb_malloc(mrb, sizeof(iv_tbl));
+  t = (iv_tbl*)mrb_calloc(mrb, 1, IV_TABLE_SIZE(count));
   t->size = 0;
-  t->alloc = 0;
-  t->ptr = NULL;
+  t->alloc = count;
 
   return t;
 }
 
-static void iv_put(mrb_state *mrb, iv_tbl *t, mrb_sym sym, mrb_value val);
-
-static void
-iv_rehash(mrb_state *mrb, iv_tbl *t)
-{
-  int old_alloc = t->alloc;
-  int new_alloc = old_alloc > 0 ? old_alloc << 1 : 4;
-  mrb_value *old_ptr = t->ptr;
-
-  t->ptr = (mrb_value*)mrb_calloc(mrb, sizeof(mrb_value)+sizeof(mrb_sym), new_alloc);
-  t->size = 0;
-  t->alloc = new_alloc;
-  if (old_alloc == 0) return;
-
-  mrb_sym *keys = (mrb_sym*)&old_ptr[old_alloc];
-  mrb_value *vals = old_ptr;
-  for (int i = 0; i < old_alloc; i++) {
-    if (IV_KEY_P(keys[i])) {
-      iv_put(mrb, t, keys[i], vals[i]);
-    }
-  }
-  mrb_free(mrb, old_ptr);
-}
-
-/* Set the value for the symbol in the instance variable table. */
-static void
-iv_put(mrb_state *mrb, iv_tbl *t, mrb_sym sym, mrb_value val)
-{
+static int
+iv_try_put(mrb_state *mrb, iv_tbl *t, mrb_sym sym, mrb_value val) {
   int hash, pos, start, dpos = -1;
 
-  if (t->alloc == 0) {
-    iv_rehash(mrb, t);
-  }
-
-  mrb_sym *keys = (mrb_sym*)&t->ptr[t->alloc];
-  mrb_value *vals = t->ptr;
+  iv_tbl_entry *entries = (iv_tbl_entry*)&t->entries;
   hash = mrb_int_hash_func(mrb, sym);
   start = pos = hash & (t->alloc-1);
   for (;;) {
-    mrb_sym key = keys[pos];
+    mrb_sym key = entries[pos].key;
     if (key == sym) {
-      vals[pos] = val;
-      return;
+      entries[pos].value = val;
+      return TRUE;
     }
     else if (key == IV_EMPTY) {
       t->size++;
-      keys[pos] = sym;
-      vals[pos] = val;
-      return;
+      entries[pos].key = sym;
+      entries[pos].value = val;
+      return TRUE;
     }
     else if (key == IV_DELETED && dpos < 0) {
       dpos = pos;
@@ -94,16 +67,42 @@ iv_put(mrb_state *mrb, iv_tbl *t, mrb_sym sym, mrb_value val)
     if (pos == start) {         /* not found */
       if (dpos >= 0) {
         t->size++;
-        keys[dpos] = sym;
-        vals[dpos] = val;
-        return;
+        entries[dpos].key = sym;
+        entries[dpos].value = val;
+        return TRUE;
       }
-      /* no room */
-      iv_rehash(mrb, t);
-      keys = (mrb_sym*)&t->ptr[t->alloc];
-      vals = t->ptr;
-      start = pos = hash & (t->alloc-1);
+      return FALSE;
     }
+  }
+}
+
+static iv_tbl*
+iv_rehash(mrb_state *mrb, iv_tbl *old)
+{
+  int old_alloc = old->alloc;
+
+  iv_tbl *new = iv_new(mrb, old->alloc << 1);
+
+  for (int i = 0; i < old_alloc; i++) {
+    iv_tbl_entry entry = old->entries[i];
+    if (IV_KEY_P(entry.key)) {
+      iv_try_put(mrb, new, entry.key, entry.value);
+    }
+  }
+
+  mrb_free(mrb, old);
+
+  return new;
+}
+
+/* Set the value for the symbol in the instance variable table. */
+static void
+iv_put(mrb_state *mrb, iv_tbl **t, mrb_sym sym, mrb_value val)
+{
+  if (!iv_try_put(mrb, *t, sym, val)) {
+    *t = iv_rehash(mrb, *t);
+    /* TODO: Do we need to handle errors here? */
+    iv_try_put(mrb, *t, sym, val);
   }
 }
 
@@ -114,17 +113,15 @@ iv_get(mrb_state *mrb, iv_tbl *t, mrb_sym sym, mrb_value *vp)
   int hash, pos, start;
 
   if (t == NULL) return FALSE;
-  if (t->alloc == 0) return FALSE;
   if (t->size == 0) return FALSE;
 
-  mrb_sym *keys = (mrb_sym*)&t->ptr[t->alloc];
-  mrb_value *vals = t->ptr;
+  iv_tbl_entry *entries = (iv_tbl_entry*)&t->entries;
   hash = mrb_int_hash_func(mrb, sym);
   start = pos = hash & (t->alloc-1);
   for (;;) {
-    mrb_sym key = keys[pos];
+    mrb_sym key = entries[pos].key;
     if (key == sym) {
-      if (vp) *vp = vals[pos];
+      if (vp) *vp = entries[pos].value;
       return pos+1;
     }
     else if (key == IV_EMPTY) {
@@ -144,19 +141,18 @@ iv_del(mrb_state *mrb, iv_tbl *t, mrb_sym sym, mrb_value *vp)
   int hash, pos, start;
 
   if (t == NULL) return FALSE;
-  if (t->alloc == 0) return FALSE;
   if (t->size == 0) return FALSE;
 
-  mrb_sym *keys = (mrb_sym*)&t->ptr[t->alloc];
-  mrb_value *vals = t->ptr;
+  iv_tbl_entry *entries = (iv_tbl_entry*)&t->entries;
   hash = mrb_int_hash_func(mrb, sym);
   start = pos = hash & (t->alloc-1);
   for (;;) {
-    mrb_sym key = keys[pos];
+    mrb_sym key = entries[pos].key;
     if (key == sym) {
-      if (vp) *vp = vals[pos];
+      if (vp) *vp = entries[pos].value;
       t->size--;
-      keys[pos] = IV_DELETED;
+      entries[pos].key = IV_DELETED;
+      entries[pos].value = mrb_nil_value();
       return TRUE;
     }
     else if (key == IV_EMPTY) {
@@ -177,11 +173,10 @@ iv_foreach(mrb_state *mrb, iv_tbl *t, mrb_iv_foreach_func *func, void *p)
   if (t->alloc == 0) return;
   if (t->size == 0) return;
 
-  mrb_sym *keys = (mrb_sym*)&t->ptr[t->alloc];
-  mrb_value *vals = t->ptr;
   for (int i=0; i<t->alloc; i++) {
-    if (IV_KEY_P(keys[i])) {
-      if ((*func)(mrb, keys[i], vals[i], p) != 0) {
+    iv_tbl_entry entry = t->entries[i];
+    if (IV_KEY_P(entry.key)) {
+      if ((*func)(mrb, entry.key, entry.value, p) != 0) {
         return;
       }
     }
@@ -205,17 +200,10 @@ iv_copy(mrb_state *mrb, iv_tbl *t)
   iv_tbl *t2;
 
   if (t == NULL) return NULL;
-  if (t->alloc == 0) return NULL;
   if (t->size == 0) return NULL;
 
-  mrb_sym *keys = (mrb_sym*)&t->ptr[t->alloc];
-  mrb_value *vals = t->ptr;
-  t2 = iv_new(mrb);
-  for (int i=0; i<t->alloc; i++) {
-    if (IV_KEY_P(keys[i])) {
-      iv_put(mrb, t2, keys[i], vals[i]);
-    }
-  }
+  t2 = iv_new(mrb, t->alloc);
+  memcpy(t2, t, IV_TABLE_SIZE(t->alloc));
   return t2;
 }
 
@@ -223,7 +211,6 @@ iv_copy(mrb_state *mrb, iv_tbl *t)
 static void
 iv_free(mrb_state *mrb, iv_tbl *t)
 {
-  mrb_free(mrb, t->ptr);
   mrb_free(mrb, t);
 }
 
@@ -360,9 +347,9 @@ mrb_obj_iv_set_force(mrb_state *mrb, struct RObject *obj, mrb_sym sym, mrb_value
     assign_class_name(mrb, obj, sym, v);
   }
   if (!obj->iv) {
-    obj->iv = iv_new(mrb);
+    obj->iv = iv_new(mrb, 4);
   }
-  iv_put(mrb, obj->iv, sym, v);
+  iv_put(mrb, &obj->iv, sym, v);
   mrb_field_write_barrier_value(mrb, (struct RBasic*)obj, v);
 }
 
@@ -658,7 +645,7 @@ mrb_mod_cv_set(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value v)
 
     if (pos) {
       mrb_check_frozen(mrb, c);
-      t->ptr[pos-1] = v;        /* iv_get returns pos+1 to put */
+      t->entries[pos-1].value = v;        /* iv_get returns pos+1 to put */
       mrb_field_write_barrier_value(mrb, (struct RBasic*)c, v);
       return;
     }
@@ -689,10 +676,10 @@ mrb_mod_cv_set(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value v)
 
   mrb_check_frozen(mrb, c);
   if (!c->iv) {
-    c->iv = iv_new(mrb);
+    c->iv = iv_new(mrb, 4);
   }
 
-  iv_put(mrb, c->iv, sym, v);
+  iv_put(mrb, &c->iv, sym, v);
   mrb_field_write_barrier_value(mrb, (struct RBasic*)c, v);
 }
 
@@ -942,13 +929,10 @@ mrb_gv_get(mrb_state *mrb, mrb_sym sym)
 MRB_API void
 mrb_gv_set(mrb_state *mrb, mrb_sym sym, mrb_value v)
 {
-  iv_tbl *t;
-
   if (!mrb->globals) {
-    mrb->globals = iv_new(mrb);
+    mrb->globals = iv_new(mrb, 4);
   }
-  t = mrb->globals;
-  iv_put(mrb, t, sym, v);
+  iv_put(mrb, &mrb->globals, sym, v);
 }
 
 MRB_API void
@@ -1116,7 +1100,7 @@ mrb_class_find_path(mrb_state *mrb, struct RClass *c)
   mrb_str_cat(mrb, path, str, len);
   if (RSTRING_PTR(path)[0] != '#') {
     iv_del(mrb, c->iv, MRB_SYM(__outer__), NULL);
-    iv_put(mrb, c->iv, MRB_SYM(__classname__), path);
+    iv_put(mrb, &c->iv, MRB_SYM(__classname__), path);
     mrb_field_write_barrier_value(mrb, (struct RBasic*)c, path);
     path = mrb_str_dup(mrb, path);
   }
